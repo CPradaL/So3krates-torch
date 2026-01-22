@@ -1,0 +1,1 @@
+{"total_mae":-1.5894572769070692e-08,"_timestamp":1.7690869758407025e+09,"_step":2729,"main":{"epoch":145,"valid_loss":2.4861159324645996,"valid_rmse_e_per_atom":0.012274397537112236,"valid_rmse_f":0.11149183660745621},"_wandb":{"runtime":632},"_runtime":632}
