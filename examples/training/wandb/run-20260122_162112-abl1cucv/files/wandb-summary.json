@@ -1,1 +1,0 @@
-{"_timestamp":1.7690958681371338e+09,"_step":2343,"train_mae_H":0.05045546591281891,"main":{"valid_rmse_e_per_atom":0.0037044037599116564,"valid_rmse_f":0.0743093192577362,"epoch":125,"valid_loss":1.1043777465820312},"_wandb":{"runtime":595},"_runtime":595,"train_mae_C":0.052217792719602585,"train_mae_O":0.0593583919107914}

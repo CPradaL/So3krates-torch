@@ -169,6 +169,8 @@ def train(
     ema: Optional[ExponentialMovingAverage] = None,
     max_grad_norm: Optional[float] = 10.0,
     log_wandb: bool = False,
+    log_per_atom: bool = False,
+    wandb_init_args: Dict[str,str]={'':''},
     distributed: bool = False,
     save_all_checkpoints: bool = False,
     plotter: TrainingPlotter = None,
@@ -183,6 +185,7 @@ def train(
     keep_last = False
     if log_wandb:
         import wandb
+        wandb.init(**wandb_init_args)
 
     if max_grad_norm is not None:
         logging.info(
@@ -262,6 +265,8 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            log_wandb=log_wandb,
+            log_per_atom=log_per_atom,
         )
         if distributed:
             torch.distributed.barrier()
@@ -378,6 +383,8 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    log_wandb=False,
+    log_per_atom=False,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -409,6 +416,8 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                log_wandb=log_wandb,
+                log_per_atom=log_per_atom, 
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
@@ -425,6 +434,8 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    log_wandb=False,
+    log_per_atom=False,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -440,6 +451,68 @@ def take_step(
             compute_stress=output_args["stress"],
         )
         loss = loss_fn(pred=output, ref=batch)
+        
+        if log_per_atom and log_wandb:
+            atomic_numbers = batch_dict['atomic_numbers']
+            F_true = batch_dict['forces']
+            F_pred = output['forces']
+            
+
+            def calculate_force_mae(pred_forces, actual_forces, atomic_numbers):
+                """
+                Calculate MAE between predicted and actual forces, overall and per element.
+                
+                Args:
+                    pred_forces: torch.Tensor of shape (N, 3) - predicted forces
+                    actual_forces: torch.Tensor of shape (N, 3) - actual forces
+                    atomic_numbers: torch.Tensor of shape (N, 1) or (N,) - atomic numbers
+                
+                Returns:
+                    dict: Contains 'total_mae' and 'per_element_mae' (dict mapping atomic number to MAE)
+                """
+
+                from mendeleev.fetch import fetch_table
+                mendeleev_table = fetch_table("elements")
+                
+                # Ensure atomic_numbers is 1D
+                if atomic_numbers.dim() == 2:
+                    atomic_numbers = atomic_numbers.squeeze(-1)
+                
+                # Calculate overall MAE
+                total_mae = torch.mean(torch.abs(pred_forces - actual_forces))
+                
+                # Get unique atomic numbers
+                unique_elements = torch.unique(atomic_numbers)
+                
+                # Calculate MAE per element
+                per_element_mae = {}
+                for element in unique_elements:
+                    # Get mask for this element
+                    mask = atomic_numbers == element
+                    
+                    # Calculate MAE for this element
+                    element_pred = pred_forces[mask]
+                    element_actual = actual_forces[mask]
+                    element_mae = torch.mean(torch.abs(element_pred - element_actual))
+                    
+                    per_element_mae[f"train_mae_{mendeleev_table[mendeleev_table["atomic_number"] == element.item()]["symbol"].iloc[0]}"] = element_mae.item()
+                
+                return {
+                    'total_mae': total_mae.item(),
+                    'per_element_mae': per_element_mae
+                }
+            
+            metrics = calculate_force_mae(F_pred,F_true,atomic_numbers)
+                
+            import wandb
+            wandb.log({'train_total_mae' : metrics['total_mae']})
+            wandb.log(metrics['per_element_mae'])
+
+        elif log_per_atom and not log_wandb:
+            logging.info(
+            f"Warning: log_per_atom set to True but log_wandb to False. log_wandb=True is required. Skipping logging. For per atom logging, set both to True"
+        )
+        
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(

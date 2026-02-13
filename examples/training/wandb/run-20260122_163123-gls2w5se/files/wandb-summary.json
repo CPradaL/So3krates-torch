@@ -1,1 +1,0 @@
-{"_wandb":{"runtime":61},"_step":434,"train_mae_C":0.3722093999385834,"train_mae_O":0.31748369336128235,"_runtime":61,"train_total_mae":0.2181163728237152,"_timestamp":1.7690959455330088e+09,"train_mae_H":0.1501908153295517,"main":{"epoch":10,"valid_loss":12.862306594848633,"valid_rmse_e_per_atom":0.20433926582336426,"valid_rmse_f":0.2535148561000824}}

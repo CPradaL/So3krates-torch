@@ -141,7 +141,7 @@ def create_model(config: dict, device: torch.device) -> SO3LR:
         )
         model = MultiHeadSO3LR(**model_params)
     else:
-        logging.info(f"Createing SO3LR model")
+        logging.info(f"Creating SO3LR model")
         model = SO3LR(**model_params)
 
     model = model.to(device)
@@ -964,6 +964,8 @@ def run_training(config: dict) -> None:
     patience = config["TRAINING"].get("patience", 50)
     max_grad_norm = config["TRAINING"].get("clip_grad", 10.0)
     log_wandb = config["MISC"].get("log_wandb", False)
+    log_per_atom = config["MISC"].get("log_per_atom", False)
+    wandb_init_args = log_wandb = config["MISC"].get("wandb_init_args",{'':''})
     save_all_checkpoints = config["MISC"].get("keep_checkpoints", False)
 
     # Setup output arguments for model evaluation
@@ -1003,6 +1005,8 @@ def run_training(config: dict) -> None:
         ema=ema,
         max_grad_norm=max_grad_norm,
         log_wandb=log_wandb,
+        log_per_atom=log_per_atom,
+        wandb_init_args=wandb_init_args,
         distributed=False,  # Single GPU training for now
         save_all_checkpoints=save_all_checkpoints,
         plotter=None,  # No plotting for now

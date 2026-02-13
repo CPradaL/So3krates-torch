@@ -1,1 +1,0 @@
-{"_runtime":574,"_wandb":{"runtime":574},"_timestamp":1.769007586857154e+09,"_step":29,"main":{"valid_rmse_e_per_atom":0.0018783772829920053,"valid_rmse_f":0.084968701004982,"epoch":145,"valid_loss":1.4439367055892944}}

@@ -1,1 +1,0 @@
-{"_timestamp":1.7690083733130314e+09,"_step":7,"carlitos":3,"_wandb":{"runtime":64},"_runtime":64,"main":{"valid_rmse_e_per_atom":0.060667917132377625,"valid_rmse_f":0.18224629759788513,"epoch":15,"valid_loss":6.643479347229004}}
