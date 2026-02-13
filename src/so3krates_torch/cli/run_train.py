@@ -14,20 +14,38 @@ from so3krates_torch.tools.utils import (
     create_configs_from_list,
     create_data_from_configs,
 )
+from so3krates_torch.tools.distributed_tools import init_distributed
 from so3krates_torch.modules.loss import (
     WeightedEnergyForcesLoss,
     WeightedEnergyForcesDipoleLoss,
     WeightedEnergyForcesHirshfeldLoss,
     WeightedEnergyForcesDipoleHirshfeldLoss,
 )
-from mace.data.utils import KeySpecification, compute_average_E0s
-from mace.modules.utils import compute_avg_num_neighbors
-from mace.tools.utils import MetricsLogger, setup_logger, AtomicNumberTable
-from mace.tools.checkpoint import CheckpointHandler, CheckpointState
+from so3krates_torch.data.utils import (
+    KeySpecification,
+    compute_average_E0s,
+)
+from so3krates_torch.data.hdf5_utils import (
+    detect_file_format,
+    PreprocessedHDF5Dataset,
+    validate_preprocessed_hdf5,
+)
+from so3krates_torch.tools.utils import (
+    AtomicNumberTable,
+    MetricsLogger,
+    compute_avg_num_neighbors,
+    setup_logger,
+)
+from so3krates_torch.tools.checkpoint import (
+    CheckpointHandler,
+    CheckpointState,
+)
 from torch_ema import ExponentialMovingAverage
 from so3krates_torch.tools.train import train
 from so3krates_torch.tools.finetune import fuse_lora_weights, setup_finetuning
 import os
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 
 DTYPE_MAP = {
@@ -167,19 +185,27 @@ def select_valid_subset(
     return data[:n_train], data[n_train : n_train + n_valid]
 
 
-def setup_data_loaders(config: dict) -> tuple:
-    """Setup training and validation data loaders."""
-    # Key specification for data loading
-    keyspec = KeySpecification(
-        info_keys={
-            "energy": "REF_energy",
-            "dipole": "REF_dipole",
-            "total_charge": "charge",
-        },
-        arrays_keys={
-            "hirshfeld_ratios": "REF_hirsh_ratios",
-            "forces": "REF_forces",
-        },
+def setup_data_loaders(
+    config: dict,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> tuple:
+    """Setup training and validation data loaders.
+
+    Returns (train_loader, valid_loaders, train_sampler,
+             avg_num_neighbors, num_elements,
+             average_atomic_energy_shifts).
+    """
+    # Key specification from defaults, with optional overrides
+    from so3krates_torch.tools.default_keys import DefaultKeys
+    from so3krates_torch.data.utils import update_keyspec_from_kwargs
+
+    keydict = DefaultKeys.keydict()
+    config_keys = config["TRAINING"].get("keys", {})
+    keydict.update(config_keys)
+    keyspec = update_keyspec_from_kwargs(
+        KeySpecification(), keydict
     )
     # Create data loaders
     batch_size = config["TRAINING"]["batch_size"]
@@ -205,10 +231,12 @@ def setup_data_loaders(config: dict) -> tuple:
                     head_data, valid_ratio, num_train, num_valid
                 )
             logging.info(
-                f"Head {head_name} - Training set size: {len(head_train_data)}"
+                f"Head {head_name} - Training set size: "
+                f"{len(head_train_data)}"
             )
             logging.info(
-                f"Head {head_name} - Validation set size: {len(head_val_data)}"
+                f"Head {head_name} - Validation set size: "
+                f"{len(head_val_data)}"
             )
 
             head_config_list_train = create_configs_from_list(
@@ -232,10 +260,22 @@ def setup_data_loaders(config: dict) -> tuple:
                 shuffle=False,
             )
 
-        average_atomic_energy_shifts = compute_average_E0s(
+        # Find elements actually present in data
+        present_zs = set()
+        for cfg in train_configs:
+            present_zs.update(cfg.atomic_numbers)
+        present_z_table = AtomicNumberTable(sorted(list(present_zs)))
+
+        # Compute E0s for present elements only
+        present_e0s = compute_average_E0s(
             collections_train=train_configs,
-            z_table=AtomicNumberTable([int(z) for z in range(1, 119)]),
+            z_table=present_z_table,
         )
+
+        # Expand to full 118 elements (fill missing with 0)
+        average_atomic_energy_shifts = {
+            z: present_e0s.get(z, 0.0) for z in range(1, 119)
+        }
         train_data = create_data_from_configs(
             train_configs,
             r_max=r_max,
@@ -243,89 +283,383 @@ def setup_data_loaders(config: dict) -> tuple:
             all_heads=list(heads.keys()),
         )
 
+        train_sampler = None
+        if distributed:
+            train_sampler = DistributedSampler(
+                train_data,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+            )
+
         train_loader = create_dataloader_from_data(
             config_list=train_data,
             batch_size=batch_size,
             shuffle=True,
+            sampler=train_sampler,
         )
+        logging.info("Computing dataset statistics (num_elements, avg_num_neighbors)...")
         num_elements = determine_num_elements(train_loader)
         avg_num_neighbors = compute_avg_num_neighbors(train_loader)
+        logging.info(
+            f"Computed: num_elements={num_elements}, "
+            f"avg_num_neighbors={avg_num_neighbors:.2f}"
+        )
         logging.info(f"Training set size: {len(train_data)}")
         logging.info(f"Validation set size: {len(val_data)}")
         logging.info(
-            f"Number of unique elements in training set: {num_elements}"
+            f"Number of unique elements in training set: "
+            f"{num_elements}"
         )
         return (
             train_loader,
             val_data,
+            train_sampler,
             avg_num_neighbors,
             num_elements,
             average_atomic_energy_shifts,
         )
 
     else:
-        # Load data
-        data_path = config["TRAINING"]["path_to_train_data"]
-        logging.info(f"Loading data from {data_path}")
-        data = read(data_path, index=":")
+        # Load training data
+        train_path = config["TRAINING"]["path_to_train_data"]
+        logging.info(f"Loading training data from {train_path}")
 
-        # Split data
-        val_data_path = config["TRAINING"].get("path_to_val_data")
-        if val_data_path:
-            val_data = read(val_data_path, index=":")
-            train_data = data
-            logging.info(
-                f"Using separate validation data from {val_data_path}"
-            )
+        # Check if data is preprocessed (explicit config or auto-detect)
+        is_train_preprocessed = config["TRAINING"].get(
+            "data_preprocessed", None
+        )
+
+        if is_train_preprocessed is None:
+            # Auto-detect from file format
+            file_format = detect_file_format(train_path)
+            is_train_preprocessed = file_format == "hdf5_preprocessed"
+            logging.info(f"Auto-detected train format: {file_format}")
         else:
-            valid_ratio = config["TRAINING"].get("valid_ratio", 0.1)
-            num_train = config["TRAINING"].get("num_train", None)
-            num_valid = config["TRAINING"].get("num_valid", None)
-            train_data, val_data = select_valid_subset(
-                data, valid_ratio, num_train, num_valid
+            # User explicitly specified
+            logging.info(
+                f"Using config-specified train "
+                f"data_preprocessed={is_train_preprocessed}"
             )
-            logging.info(f"Splitting data with validation ratio {valid_ratio}")
+            # Validate that file matches expectation
+            if is_train_preprocessed:
+                if not train_path.endswith((".h5", ".hdf5")):
+                    raise ValueError(
+                        f"data_preprocessed=true but file is not HDF5: "
+                        f"{train_path}"
+                    )
+                # Validate it actually contains preprocessed data
+                validate_preprocessed_hdf5(
+                    train_path,
+                    expected_r_max=r_max,
+                    expected_r_max_lr=r_max_lr,
+                )
 
-        train_configs = create_configs_from_list(
-            atoms_list=train_data,
-            key_specification=keyspec,
-        )
+        # Load training data based on format
+        if is_train_preprocessed:
+            # Load preprocessed HDF5 directly (fast path)
+            logging.info(
+                "Loading preprocessed HDF5 training data "
+                "(with neighbor lists)"
+            )
+            train_dataset = PreprocessedHDF5Dataset(
+                hdf5_path=train_path,
+                validate_cutoffs=True,
+                expected_r_max=r_max,
+                expected_r_max_lr=r_max_lr,
+            )
+            z_table = train_dataset.z_table
+            avg_num_neighbors = train_dataset.metadata.get(
+                "avg_num_neighbors", None
+            )
+            num_elements = train_dataset.metadata.get("num_elements", None)
 
-        average_atomic_energy_shifts = compute_average_E0s(
-            collections_train=train_configs,
-            z_table=AtomicNumberTable([int(z) for z in range(1, 119)]),
-        )
-        train_atomic_data = create_data_from_configs(
-            train_configs,
-            r_max=r_max,
-            r_max_lr=r_max_lr,
-        )
+            # Splitting happens below if no separate val path
+            train_atomic_data = train_dataset
+            train_configs = None  # Not available for preprocessed
+
+        else:
+            # Load via Configuration pathway (XYZ or raw HDF5)
+            if train_path.endswith(".xyz"):
+                logging.info("Loading XYZ training data")
+                data = read(train_path, index=":")
+            elif train_path.endswith((".h5", ".hdf5")):
+                logging.info("Loading raw HDF5 training data")
+                from so3krates_torch.data.hdf5_utils import (
+                    load_atoms_from_hdf5,
+                )
+
+                data = load_atoms_from_hdf5(train_path, index=None)
+            else:
+                raise ValueError(
+                    f"Unsupported training file format: {train_path}"
+                )
+
+            # Split data if needed
+            val_data_path = config["TRAINING"].get("path_to_val_data")
+            if val_data_path:
+                train_data = data
+                logging.info(
+                    f"Using separate validation data from "
+                    f"{val_data_path}"
+                )
+            else:
+                valid_ratio = config["TRAINING"].get(
+                    "valid_ratio", 0.1
+                )
+                num_train = config["TRAINING"].get(
+                    "num_train", None
+                )
+                num_valid = config["TRAINING"].get(
+                    "num_valid", None
+                )
+                train_data, val_data_split = (
+                    select_valid_subset(
+                        data, valid_ratio, num_train, num_valid
+                    )
+                )
+                logging.info(
+                    f"Splitting training data with validation "
+                    f"ratio {valid_ratio}"
+                )
+
+            # Create configurations
+            train_configs = create_configs_from_list(
+                atoms_list=train_data,
+                key_specification=keyspec,
+            )
+
+            # Create z_table (use all 118 elements for compatibility)
+            z_table = AtomicNumberTable([int(z) for z in range(1, 119)])
+
+            # Preprocess (compute neighbor lists)
+            logging.info("Preprocessing training data (computing neighbor lists)")
+            train_atomic_data = create_data_from_configs(
+                train_configs,
+                r_max=r_max,
+                r_max_lr=r_max_lr,
+            )
+            num_elements = None  # Will be computed below
+            avg_num_neighbors = None  # Will be computed below
+
+        # Compute average atomic energy shifts
+        if train_configs is not None:
+            # Find elements actually present in data
+            present_zs = set()
+            for cfg in train_configs:
+                present_zs.update(cfg.atomic_numbers)
+            present_z_table = AtomicNumberTable(sorted(list(present_zs)))
+
+            # Compute E0s for present elements only
+            present_e0s = compute_average_E0s(
+                collections_train=train_configs,
+                z_table=present_z_table,
+            )
+
+            # Expand to full 118 elements (fill missing with 0)
+            average_atomic_energy_shifts = {
+                z: present_e0s.get(z, 0.0) for z in range(1, 119)
+            }
+        else:
+            # Try to load E0s from HDF5, fall back to computation if not
+            # available
+            if (
+                hasattr(train_dataset, "atomic_energy_shifts")
+                and train_dataset.atomic_energy_shifts is not None
+            ):
+                # Use stored E0s from preprocessing
+                present_e0s = train_dataset.atomic_energy_shifts
+                logging.info(
+                    "Using atomic energy shifts (E0s) loaded from "
+                    "preprocessed HDF5"
+                )
+            else:
+                # Fallback: compute from dataset (backward compatibility)
+                from so3krates_torch.data.utils import (
+                    compute_average_E0s_from_dataset,
+                )
+
+                logging.info(
+                    "Computing atomic energy shifts (E0s) from "
+                    "preprocessed data (not found in HDF5)..."
+                )
+                present_e0s = compute_average_E0s_from_dataset(
+                    train_dataset, z_table
+                )
+
+            # Expand to full 118 elements
+            average_atomic_energy_shifts = {
+                z: present_e0s.get(z, 0.0) for z in range(1, 119)
+            }
+
+        # For preprocessed data, perform train/valid split BEFORE creating loaders
+        val_data_path = config["TRAINING"].get("path_to_val_data")
+        if is_train_preprocessed and not val_data_path:
+            # Split preprocessed dataset using PyTorch Subset
+            from torch.utils.data import Subset
+
+            valid_ratio = config["TRAINING"].get("valid_ratio", 0.1)
+            total_size = len(train_dataset)
+            indices = list(range(total_size))
+            random.shuffle(indices)
+
+            # Split: valid_ratio goes to validation, rest to training
+            n_valid = int(total_size * valid_ratio)
+            n_train = total_size - n_valid
+
+            train_indices = indices[:n_train]
+            valid_indices = indices[n_train:]
+
+            # Update train_atomic_data to use subset
+            train_atomic_data = Subset(train_dataset, train_indices)
+            valid_dataset_subset = Subset(train_dataset, valid_indices)
+
+            logging.info(
+                f"Split preprocessed data: {n_train} train, "
+                f"{n_valid} valid (ratio={valid_ratio})"
+            )
+
+        # Create training sampler and loader
+        train_sampler = None
+        if distributed:
+            train_sampler = DistributedSampler(
+                train_atomic_data,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+            )
 
         train_loader = create_dataloader_from_data(
             config_list=train_atomic_data,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
         )
 
-        num_elements = determine_num_elements(train_loader)
-        avg_num_neighbors = compute_avg_num_neighbors(train_loader)
+        # Compute metrics (with fallback for backward compatibility)
+        if num_elements is None:
+            logging.info(
+                "num_elements not found in metadata, computing from data (slow)..."
+            )
+            num_elements = determine_num_elements(train_loader)
+        else:
+            logging.info(
+                f"Loaded num_elements={num_elements} from preprocessed metadata"
+            )
 
-        valid_loader = create_dataloader_from_list(
-            val_data,
-            batch_size=valid_batch_size,
-            r_max=r_max,
-            r_max_lr=r_max_lr,
-            key_specification=keyspec,
-            shuffle=False,
-        )
-        logging.info(f"Training set size: {len(train_data)}")
-        logging.info(f"Validation set size: {len(val_data)}")
+        if avg_num_neighbors is None:
+            logging.info(
+                "avg_num_neighbors not found in metadata, computing from data (slow)..."
+            )
+            avg_num_neighbors = compute_avg_num_neighbors(train_loader)
+        else:
+            logging.info(
+                f"Loaded avg_num_neighbors={avg_num_neighbors:.2f} from preprocessed metadata"
+            )
+
+        # Load validation data
+        if val_data_path:
+            logging.info(f"Loading validation data from {val_data_path}")
+
+            # Check if validation data is preprocessed
+            is_valid_preprocessed = config["TRAINING"].get(
+                "valid_data_preprocessed", None
+            )
+
+            if is_valid_preprocessed is None:
+                # Auto-detect
+                valid_format = detect_file_format(val_data_path)
+                is_valid_preprocessed = (
+                    valid_format == "hdf5_preprocessed"
+                )
+                logging.info(
+                    f"Auto-detected validation format: {valid_format}"
+                )
+            else:
+                logging.info(
+                    f"Using config-specified validation "
+                    f"data_preprocessed={is_valid_preprocessed}"
+                )
+                if is_valid_preprocessed:
+                    validate_preprocessed_hdf5(
+                        val_data_path,
+                        expected_r_max=r_max,
+                        expected_r_max_lr=r_max_lr,
+                    )
+
+            if is_valid_preprocessed:
+                # Load preprocessed validation data
+                valid_dataset = PreprocessedHDF5Dataset(
+                    hdf5_path=val_data_path,
+                    validate_cutoffs=True,
+                    expected_r_max=r_max,
+                    expected_r_max_lr=r_max_lr,
+                )
+                valid_loader = create_dataloader_from_data(
+                    config_list=valid_dataset,
+                    batch_size=valid_batch_size,
+                    shuffle=False,
+                )
+            else:
+                # Load validation data via Configuration pathway
+                if val_data_path.endswith(".xyz"):
+                    val_data = read(val_data_path, index=":")
+                elif val_data_path.endswith((".h5", ".hdf5")):
+                    from so3krates_torch.data.hdf5_utils import (
+                        load_atoms_from_hdf5,
+                    )
+
+                    val_data = load_atoms_from_hdf5(
+                        val_data_path, index=None
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported validation file format: "
+                        f"{val_data_path}"
+                    )
+
+                valid_loader = create_dataloader_from_list(
+                    val_data,
+                    batch_size=valid_batch_size,
+                    r_max=r_max,
+                    r_max_lr=r_max_lr,
+                    key_specification=keyspec,
+                    shuffle=False,
+                )
+        else:
+            # Use split from training data
+            if is_train_preprocessed:
+                # Preprocessed split was already done above
+                valid_loader = create_dataloader_from_data(
+                    config_list=valid_dataset_subset,
+                    batch_size=valid_batch_size,
+                    shuffle=False,
+                )
+            else:
+                # Use validation split from earlier
+                valid_loader = create_dataloader_from_list(
+                    val_data_split,
+                    batch_size=valid_batch_size,
+                    r_max=r_max,
+                    r_max_lr=r_max_lr,
+                    key_specification=keyspec,
+                    shuffle=False,
+                )
+
+        logging.info(f"Training set size: {len(train_atomic_data)}")
+        if valid_loader is not None:
+            logging.info(
+                f"Validation set size: "
+                f"{len(valid_loader.dataset)}"
+            )
         logging.info(
-            f"Number of unique elements in training set: {num_elements}"
+            f"Number of unique elements in training set: "
+            f"{num_elements}"
         )
         return (
             train_loader,
-            {"main": valid_loader},
+            {"main": valid_loader} if valid_loader else {},
+            train_sampler,
             avg_num_neighbors,
             num_elements,
             average_atomic_energy_shifts,
@@ -571,7 +905,7 @@ def load_pretrained_model_direct(
     logging.info(f"Loading complete pretrained model from: {pretrained_path}")
 
     # Load the pretrained model
-    loaded_object = torch.load(pretrained_path, map_location=device)
+    loaded_object = torch.load(pretrained_path, map_location=device, weights_only=False)
 
     if isinstance(loaded_object, torch.nn.Module):
         # If it's a complete model object, return it directly
@@ -806,29 +1140,37 @@ def set_dtype_model(model: torch.nn.Module, dtype_str: str) -> None:
 
 
 def run_training(config: dict) -> None:
-    """
-    Execute the complete training pipeline.
+    """Execute the complete training pipeline."""
+    # ---- distributed init (must come first) ----
+    rank, local_rank, world_size, distributed = (
+        init_distributed_from_config(config)
+    )
 
-    Args:
-        config: Configuration dictionary containing all training parameters
-    """
-    # Setup logging
-    # Clear all handlers from root
-    logging.getLogger().handlers.clear()
+    print(f"Distributed setup: rank={rank}, local_rank={local_rank}, world_size={world_size}, distributed={distributed}")
+    # Setup logging (only on rank 0 to avoid duplicate logs)
+    if rank == 0:
+        logging.getLogger().handlers.clear()
+        logging.Logger.manager.loggerDict.clear()
+        setup_logging(config)
 
-    # Clear all existing loggers
-    logging.Logger.manager.loggerDict.clear()
-    setup_logging(config)
+    if distributed:
+        logging.info(
+            f"Distributed training: rank={rank}, "
+            f"local_rank={local_rank}, world_size={world_size}"
+        )
 
     dtype_str = config["GENERAL"].get("default_dtype", "float32")
     torch.set_default_dtype(DTYPE_MAP[dtype_str])
 
     # Get pretrained model settings from config
-    pretrained_weights = config["TRAINING"].get("pretrained_weights", None)
-    pretrained_model = config["TRAINING"].get("pretrained_model", None)
+    pretrained_weights = config["TRAINING"].get(
+        "pretrained_weights", None
+    )
+    pretrained_model = config["TRAINING"].get(
+        "pretrained_model", None
+    )
     no_checkpoint = config["MISC"].get("no_checkpoint", False)
 
-    # Validate pretrained settings
     if pretrained_weights and pretrained_model:
         raise ValueError(
             "Cannot specify both 'pretrained_weights' and "
@@ -837,27 +1179,26 @@ def run_training(config: dict) -> None:
             "'pretrained_model' for complete model."
         )
 
-    # Override checkpoint loading if specified in config
     if no_checkpoint:
         config["MISC"]["restart_latest"] = False
 
-    # Setup device
-    device_name = config["MISC"].get("device", "cuda")
-    device = torch.device(device_name)
+    # ---- device ----
+    if distributed:
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        device_name = config["MISC"].get("device", "cuda")
+        device = torch.device(device_name)
     logging.info(f"Using device: {device}")
 
-    # Handle model creation and pretrained loading
+    # ---- model creation ----
     warm_start = False
     if pretrained_model:
-        # Load complete pretrained model (ignores config architecture)
         model = load_pretrained_model_direct(pretrained_model, device)
         logging.info("Using complete pretrained model.")
         warm_start = True
     else:
-        # Create model from config
         model = create_model(config, device)
-
-        # Load pretrained weights if specified
         if pretrained_weights:
             load_pretrained_weights(model, pretrained_weights, device)
             warm_start = True
@@ -866,36 +1207,50 @@ def run_training(config: dict) -> None:
         f"Model r_max ({model.r_max}) does not match config "
         f"r_max ({config['ARCHITECTURE'].get('r_max', 4.5)})"
     )
-
-    assert model.r_max_lr == config["ARCHITECTURE"].get("r_max_lr", None), (
-        f"Model r_max_lr ({model.r_max_lr}) does not match config "
-        f"r_max_lr ({config['ARCHITECTURE'].get('r_max_lr', None)})"
+    assert model.r_max_lr == config["ARCHITECTURE"].get(
+        "r_max_lr", None
+    ), (
+        f"Model r_max_lr ({model.r_max_lr}) does not match "
+        f"config r_max_lr "
+        f"({config['ARCHITECTURE'].get('r_max_lr', None)})"
     )
 
-    # Setup data loaders
+    # ---- data loaders (with DistributedSampler when needed) ----
     (
         train_loader,
         valid_loaders,
+        train_sampler,
         avg_num_neighbors,
         num_elements,
         average_atomic_energy_shifts,
-    ) = setup_data_loaders(config)
+    ) = setup_data_loaders(
+        config,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
+    )
 
     if warm_start:
-        if config["TRAINING"].get("ft_update_avg_num_neighbors", False):
+        if config["TRAINING"].get(
+            "ft_update_avg_num_neighbors", False
+        ):
             logging.info(
-                "Updating average number of neighbors from training data "
-                "for fine-tuning."
+                "Updating average number of neighbors from "
+                "training data for fine-tuning."
             )
             model.avg_num_neighbors = avg_num_neighbors
         else:
             logging.info(
-                "Retaining average number of neighbors from pretrained model "
-                "for fine-tuning."
+                "Retaining average number of neighbors from "
+                "pretrained model for fine-tuning."
             )
             avg_num_neighbors = model.avg_num_neighbors
-        atomic_energy_shifts = model.atomic_energy_output_block.energy_shifts
-        if config["TRAINING"].get("force_use_average_shifts", False):
+        atomic_energy_shifts = (
+            model.atomic_energy_output_block.energy_shifts
+        )
+        if config["TRAINING"].get(
+            "force_use_average_shifts", False
+        ):
             atomic_energy_shifts = average_atomic_energy_shifts
             logging.info(
                 "Forcing use of average atomic energy shifts "
@@ -906,42 +1261,55 @@ def run_training(config: dict) -> None:
         atomic_shifts_config = config["ARCHITECTURE"].get(
             "atomic_energy_shifts", None
         )
-        # sort the shifts by atomic number and add all remaining elements as 0
         if atomic_shifts_config is not None:
             atomic_energy_shifts = process_config_atomic_energies(
                 atomic_shifts_config
             )
-            logging.info("Using provided atomic energy shifts for training.")
-
+            logging.info(
+                "Using provided atomic energy shifts for "
+                "training."
+            )
         else:
             atomic_energy_shifts = average_atomic_energy_shifts
             logging.info(
-                "Using average atomic energy shifts computed from training data for training."
+                "Using average atomic energy shifts computed "
+                "from training data for training."
             )
 
     # Setup finetuning if specified
     if config["TRAINING"].get("finetune_choice", None):
-        model = handle_finetuning(config, model, num_elements, device_name)
+        model = handle_finetuning(
+            config, model, num_elements, str(device)
+        )
 
     logging.info(f"Atomic energy shifts: {atomic_energy_shifts}")
     set_atomic_energy_shifts_in_model(model, atomic_energy_shifts)
     set_avg_num_neighbors_in_model(model, avg_num_neighbors)
+    set_dtype_model(
+        model, config["GENERAL"].get("default_dtype", "float32")
+    )
 
-    set_dtype_model(model, config["GENERAL"].get("default_dtype", "float32"))
+    # ---- wrap model in DDP (after all weight mutations) ----
+    ddp_model = None
+    if distributed:
+        ddp_model = wrap_model_ddp(model, local_rank)
 
     # Setup loss function
     loss_fn = setup_loss_function(config)
 
     # Setup optimizer and scheduler
-    optimizer, lr_scheduler = setup_optimizer_and_scheduler(model, config)
+    optimizer, lr_scheduler = setup_optimizer_and_scheduler(
+        model, config
+    )
 
     # Setup training tools
-    logger, checkpoint_handler, ema = setup_training_tools(config, model)
+    logger, checkpoint_handler, ema = setup_training_tools(
+        config, model
+    )
 
-    # Load checkpoint if exists (unless pretrained model was loaded)
+    # Load checkpoint if exists
     start_epoch = 0
     if not pretrained_weights and not pretrained_model:
-        # Skip checkpoint if any pretrained model was loaded
         start_epoch = load_checkpoint_if_exists(
             model=model,
             optimizer=optimizer,
@@ -952,13 +1320,17 @@ def run_training(config: dict) -> None:
             config=config,
         )
 
-    logging.info("Model, data loaders, and training components initialized")
+    logging.info(
+        "Model, data loaders, and training components initialized"
+    )
     if start_epoch > 0:
-        logging.info(f"Resuming training from epoch {start_epoch}")
+        logging.info(
+            f"Resuming training from epoch {start_epoch}"
+        )
     else:
         logging.info("Starting fresh training.")
 
-    # Setup training parameters
+    # Training parameters
     max_num_epochs = config["TRAINING"]["num_epochs"]
     eval_interval = config["TRAINING"].get("eval_interval", 1)
     patience = config["TRAINING"].get("patience", 50)
@@ -966,25 +1338,26 @@ def run_training(config: dict) -> None:
     log_wandb = config["MISC"].get("log_wandb", False)
     log_per_atom = config["MISC"].get("log_per_atom", False)
     wandb_init_args = log_wandb = config["MISC"].get("wandb_init_args",{'':''})
-    save_all_checkpoints = config["MISC"].get("keep_checkpoints", False)
+    save_all_checkpoints = config["MISC"].get(
+        "keep_checkpoints", False
+    )
 
-    # Setup output arguments for model evaluation
     output_args = {
-        "forces": True,  # Always compute forces for training
+        "forces": True,
         "virials": config["GENERAL"].get("compute_stress", False),
         "stress": config["GENERAL"].get("compute_stress", False),
     }
 
-    # Get error logging type
     log_errors = config["MISC"].get("error_table", "PerAtomMAE")
 
     if config["ARCHITECTURE"].get("use_multihead", False):
         logging.info(
-            "Enabling head selection for multi-head model during training."
+            "Enabling head selection for multi-head model "
+            "during training."
         )
         model.select_heads = True
+
     logging.info("Starting training loop...")
-    # Start training
     train(
         model=model,
         loss_fn=loss_fn,
@@ -1007,18 +1380,19 @@ def run_training(config: dict) -> None:
         log_wandb=log_wandb,
         log_per_atom=log_per_atom,
         wandb_init_args=wandb_init_args,
-        distributed=False,  # Single GPU training for now
+        distributed=distributed,
         save_all_checkpoints=save_all_checkpoints,
-        plotter=None,  # No plotting for now
-        distributed_model=None,
-        train_sampler=None,
-        rank=0,
+        plotter=None,
+        distributed_model=ddp_model,
+        train_sampler=train_sampler,
+        rank=rank,
     )
     logging.info("Training completed successfully!")
 
     if config["ARCHITECTURE"].get("use_multihead", False):
         logging.info(
-            "Disabling head selection for multi-head model after training."
+            "Disabling head selection for multi-head model "
+            "after training."
         )
         model.select_heads = False
 
@@ -1027,16 +1401,50 @@ def run_training(config: dict) -> None:
         "lora",
         "vera",
     ]:
-        logging.info("Fusing LoRA weights into base model for saving...")
+        logging.info(
+            "Fusing LoRA weights into base model for saving..."
+        )
         model = fuse_lora_weights(model)
         logging.info("LoRA weights fused successfully.")
-    # TODO: use EMA weights if enabled before saving
 
-    # save the model in the working directory
-    final_model_path = f'{config["GENERAL"]["name_exp"]}.pth'
+    # Only rank 0 saves the final model
+    if rank == 0:
+        final_model_path = (
+            f'{config["GENERAL"]["name_exp"]}.pth'
+        )
+        torch.save(model.state_dict(), final_model_path)
+        torch.save(
+            model, final_model_path.replace(".pth", ".model")
+        )
 
-    torch.save(model.state_dict(), final_model_path)
-    torch.save(model, final_model_path.replace(".pth", ".model"))
+def init_distributed_from_config(config: dict):
+    """Initialise distributed training and return rank info.
+
+    Returns (rank, local_rank, world_size, distributed_flag).
+    When distributed is disabled the process group is *not* created
+    and all ranks default to 0 / world_size 1.
+    """
+    distributed = config["MISC"].get("distributed", False)
+    rank, local_rank, world_size = init_distributed(
+        distributed=distributed,
+        launcher=config["MISC"].get("launcher", None),
+    )
+    is_distributed = distributed and world_size > 1
+    return rank, local_rank, world_size, is_distributed
+
+
+def wrap_model_ddp(model, local_rank):
+    """Wrap an already-device-placed model in DDP."""
+    device = torch.device(f"cuda:{local_rank}")
+    model = model.to(device)
+    return DDP(
+        model, 
+        device_ids=[local_rank],
+        find_unused_parameters=True,
+        )
+
+
+
 
 
 def main():

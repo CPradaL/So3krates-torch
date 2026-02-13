@@ -222,6 +222,31 @@ class So3krates(torch.nn.Module):
             device=self.device,
         )
 
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Load state dict with backward compatibility for models saved before
+        degree_repeats and vera_* matrices were converted to buffers.
+        """
+        # Check if state dict is missing the new buffer keys
+        missing_buffer_keys = [
+            key for key in self.state_dict().keys()
+            if 'degree_repeats' in key or 'vera_' in key
+        ]
+
+        has_missing_buffers = any(
+            key not in state_dict for key in missing_buffer_keys
+        )
+
+        if has_missing_buffers and strict:
+            # Old state dict detected - load with strict=False
+            # The missing buffers are already initialized correctly in __init__
+            print("Loading old state dict format (missing degree_repeats/vera buffers). "
+                  "Using strict=False to skip non-trainable computed buffers.")
+            return super().load_state_dict(state_dict, strict=False)
+        else:
+            # New state dict or strict=False explicitly requested
+            return super().load_state_dict(state_dict, strict=strict)
+
     def _get_graph(
         self,
         data: Dict[str, torch.Tensor],
@@ -316,9 +341,22 @@ class So3krates(torch.nn.Module):
         rbf = self.radial_embedding(self.lengths)
 
         ######### TRANSFORMER #########
+        n_real = self.lammps_natoms[0] if self.is_lammps else 0
+        n_total = self.lammps_natoms[1] if self.is_lammps else 0
+        has_ghosts = self.is_lammps and n_total > n_real
+
         if return_att:
             att_scores = {"inv": {}, "ev": {}}
         for layer_idx, transformer in enumerate(self.euclidean_transformers):
+            # Sync ghost atom features before each layer (except the first,
+            # where all n_total features are already correct from embedding).
+            # After each layer we truncate to n_real; here we pad back to
+            # n_total and use LAMMPS reverse-communication to copy the real
+            # atom features into their ghost copies.
+            if has_ghosts and layer_idx > 0:
+                inv_features = self._lammps_pad_and_sync(inv_features)
+                ev_features = self._lammps_pad_and_sync(ev_features)
+
             transformer_output = transformer(
                 inv_features=inv_features,
                 ev_features=ev_features,
@@ -339,10 +377,46 @@ class So3krates(torch.nn.Module):
             else:
                 inv_features, ev_features = transformer_output
 
+            # After each layer, truncate to real atoms only.  Ghost atom
+            # features are stale (they never receive messages because they
+            # only appear as senders, never receivers).  Keeping them would
+            # pollute the next layer.
+            if has_ghosts:
+                inv_features = inv_features[:n_real]
+                ev_features = ev_features[:n_real]
+
+        if has_ghosts:
+            # Final pad+sync so downstream code (output block, energy sum)
+            # sees n_total features.  The output block only reads [:n_real],
+            # but the autograd graph for edge_forces needs features at ghost
+            # indices to be connected to the real atom features.
+            inv_features = self._lammps_pad_and_sync(inv_features)
+            ev_features = self._lammps_pad_and_sync(ev_features)
+
         if return_att:
             return inv_features, ev_features, att_scores
         else:
             return inv_features, ev_features
+
+    def _lammps_pad_and_sync(self, features: torch.Tensor) -> torch.Tensor:
+        """Pad real-atom features with zeros for ghosts, then sync via LAMMPS.
+
+        After truncation to n_real atoms, ghost atoms have no features.
+        This pads the tensor back to n_total and calls LAMMPS
+        forward_exchange to copy real atom features to their ghost copies.
+        The backward pass (reverse_exchange) accumulates ghost gradients
+        back onto the real atoms, which is essential for correct edge forces.
+        """
+        n_real, n_total = self.lammps_natoms
+        n_ghost = n_total - n_real
+        pad = torch.zeros(
+            (n_ghost, features.shape[1]),
+            dtype=features.dtype,
+            device=features.device,
+        )
+        features = torch.cat((features, pad), dim=0)
+        features = utils.LAMMPS_MP.apply(features, self.lammps_class)
+        return features
 
     def _create_output_dict(
         self,
@@ -408,18 +482,27 @@ class So3krates(torch.nn.Module):
             data,
         )
 
-        total_energy = scatter.scatter_sum(
-            src=atomic_energies,
-            index=self.batch_segments,
-            dim=0,
-            dim_size=self.data_ptr.shape[0] - 1,
-        ).squeeze(-1)
+        if self.is_lammps:
+            n_real = self.lammps_natoms[0]
+            total_energy = scatter.scatter_sum(
+                src=atomic_energies[:n_real],
+                index=self.batch_segments[:n_real],
+                dim=0,
+                dim_size=1,
+            ).squeeze(-1)
+        else:
+            total_energy = scatter.scatter_sum(
+                src=atomic_energies,
+                index=self.batch_segments,
+                dim=0,
+                dim_size=self.data_ptr.shape[0] - 1,
+            ).squeeze(-1)
 
         forces, virials, stress, hessian, edge_forces = utils.get_outputs(
             energy=total_energy,
             positions=self.positions,
             displacement=self.displacement,
-            vectors=self.vectors,
+            vectors=self.ctx.vectors,
             cell=self.cell,
             training=training,
             compute_force=compute_force,
@@ -429,7 +512,7 @@ class So3krates(torch.nn.Module):
             compute_edge_forces=compute_edge_forces,
         )
         return self._create_output_dict(
-            energy=total_energy,
+            total_energy=total_energy,
             forces=forces,
             virials=virials,
             stress=stress,
@@ -507,6 +590,31 @@ class SO3LR(So3krates):
         self.dispersion_potential = DispersionInteraction(
             neighborlist_format_lr=self.neighborlist_format_lr
         )
+
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Load state dict with backward compatibility for models saved before
+        degree_repeats and vera_* matrices were converted to buffers.
+        """
+        # Check if state dict is missing the new buffer keys
+        missing_buffer_keys = [
+            key for key in self.state_dict().keys()
+            if 'degree_repeats' in key or 'vera_' in key
+        ]
+
+        has_missing_buffers = any(
+            key not in state_dict for key in missing_buffer_keys
+        )
+
+        if has_missing_buffers and strict:
+            # Old state dict detected - load with strict=False
+            # The missing buffers are already initialized correctly in __init__
+            print("Loading old state dict format (missing degree_repeats/vera buffers). "
+                  "Using strict=False to skip non-trainable computed buffers.")
+            return super().load_state_dict(state_dict, strict=False)
+        else:
+            # New state dict or strict=False explicitly requested
+            return super().load_state_dict(state_dict, strict=strict)
 
     def _get_graph(
         self,
@@ -589,6 +697,7 @@ class SO3LR(So3krates):
         hirshfeld_ratios: torch.Tensor,
         inv_features: torch.Tensor,
         att_scores: torch.Tensor,
+        node_energy: Optional[torch.Tensor] = None,
         training: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
 
@@ -599,6 +708,7 @@ class SO3LR(So3krates):
             "stress": stress,
             "hessian": hessian,
             "edge_forces": edge_forces,
+            "node_energy": node_energy,
             "zbl_repulsion": zbl_atomic_energies,
             "partial_charges": partial_charges,
             "dipole": dipole,
@@ -714,17 +824,31 @@ class SO3LR(So3krates):
             electrostatic_energies=electrostatic_energies,
             dispersion_energies=dispersion_energies,
         )
-        total_energy = scatter.scatter_sum(
-            src=atomic_energies,
-            index=self.batch_segments,
-            dim=0,
-            dim_size=self.data_ptr.shape[0] - 1,
-        ).squeeze(-1)
+        # In LAMMPS mode, only sum real (non-ghost) atom energies so that
+        # edge forces derived via autograd do not include ghost contributions.
+        if self.is_lammps:
+            n_real = self.lammps_natoms[0]
+            total_energy = scatter.scatter_sum(
+                src=atomic_energies[:n_real],
+                index=self.batch_segments[:n_real],
+                dim=0,
+                dim_size=1,
+            ).squeeze(-1)
+        else:
+            total_energy = scatter.scatter_sum(
+                src=atomic_energies,
+                index=self.batch_segments,
+                dim=0,
+                dim_size=self.data_ptr.shape[0] - 1,
+            ).squeeze(-1)
         forces, virials, stress, hessian, edge_forces = self._get_outputs(
             energy=total_energy,
             positions=self.positions,
             displacement=self.displacement,
-            vectors=self.vectors,
+            # Use original (non-negated) vectors for correct edge force sign.
+            # self.vectors is negated (-1 * ctx.vectors) for So3krates' internal
+            # convention, but edge forces must be w.r.t. the original LAMMPS vectors.
+            vectors=self.ctx.vectors,
             cell=self.cell,
             training=training,
             compute_force=compute_force,
@@ -752,6 +876,7 @@ class SO3LR(So3krates):
             ),
             inv_features=inv_features if return_descriptors else None,
             att_scores=att_scores if return_att else None,
+            node_energy=atomic_energies,
             training=training,
         )
 
@@ -884,6 +1009,7 @@ class MultiHeadSO3LR(SO3LR):
         hirshfeld_ratios: torch.Tensor,
         inv_features: torch.Tensor,
         att_scores: torch.Tensor,
+        node_energy: Optional[torch.Tensor] = None,
         training: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
 
@@ -897,6 +1023,7 @@ class MultiHeadSO3LR(SO3LR):
             "stress": stress,
             "hessian": hessian,
             "edge_forces": edge_forces,
+            "node_energy": node_energy,
             "zbl_repulsion": zbl_atomic_energies,
             "partial_charges": partial_charges,
             "dipole": dipole,
